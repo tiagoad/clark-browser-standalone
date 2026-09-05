@@ -1,0 +1,325 @@
+#!/bin/bash
+set -euo pipefail
+
+CLARK_REPO="clark-labs-inc/clark-browser"
+SCRIPT_NAME=${0##*/}
+
+SYSTEM_PLATFORM="unknown"
+case "$(uname -s)" in
+    Darwin)                 SYSTEM_PLATFORM="darwin" ;;
+    Linux)                  SYSTEM_PLATFORM="linux" ;;
+    MINGW*|MSYS*|CYGWIN*)   SYSTEM_PLATFORM="windows" ;;
+esac
+
+SYSTEM_ARCH="unknown"
+case "$(uname -m)" in
+    x86_64|amd64)  SYSTEM_ARCH="x64" ;;
+    aarch64|arm64) SYSTEM_ARCH="arm64" ;;
+esac
+
+print_help() {
+  cat <<HELP >&2
+Usage:
+  $SCRIPT_NAME versions
+    Lists versions available for download
+
+  $SCRIPT_NAME download [OPTIONS] DIRECTORY
+    Downloads clark to the provided DIRECTORY.
+
+    Note: A file will be written to DIRECTORY/clark-exe-path containing
+    the relative path to the browser executable.
+
+    Options:
+      DIRECTORY
+        Output directory for the downloaded browser
+      -v, --version=VERSION
+        Version to download. default=latest
+      -p, --platform
+        Browser platform (windows/linux/darwin) default=$SYSTEM_PLATFORM
+      -a, --arch
+        Browser architecture (arm64/x64) default=$SYSTEM_ARCH
+      --overwrite
+        Allow DIRECTORY to already exist
+      --keep-archive
+        Keeps the downloaded archive in the output directory
+      --no-extract
+        Skips extracting the archive to the output directory
+HELP
+}
+
+main() {
+  require_command curl
+  entrypoint "$@"
+}
+
+require_command() {
+  local command="$1"
+  if ! command -v "$command" >/dev/null 2>&1 ; then
+    die 1 "Error: command $command is not available"
+  fi
+}
+
+log() {
+  echo "$@" >&2
+}
+
+die() {
+  local extract_exit="$1"
+  local message="${2:-}"
+  if [[ "$message" != "" ]]; then
+    log "$message"
+  fi
+  exit "$extract_exit"
+}
+
+gh_api() {
+  local endpoint="$1"
+  curl -fsSL \
+    -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/$endpoint"
+}
+
+get_version_meta() {
+  local version="$1"
+
+  if [[ "$version" == latest ]]; then
+    gh_api "repos/${CLARK_REPO}/releases?per_page=1" | jq -cM '.[0]'
+  else
+    gh_api "repos/${CLARK_REPO}/releases/tags/$version" | jq -cM '.'
+  fi  
+}
+
+cmd_versions() {
+  gh_api "repos/${CLARK_REPO}/releases?per_page=100" |
+    jq -r '[.[].tag_name | select(startswith("chromium-"))] | reverse[]'
+}
+
+cmd_download() {
+  local version="$1"
+  local platform="$2"
+  local arch="$3"
+  local overwrite="$4"
+  local directory="$5"
+  local keep_archive="$6"
+  local no_extract="$7"
+
+  if [[ "$overwrite" != "yes" && (-e "$directory" || -L "$directory") ]]; then
+    die 2 "Error: Path '$directory' already exists. Use --overwrite to continue anyway."
+  fi
+  mkdir -p "$directory"
+
+  log "Pulling metadata for version '$version' ($platform-$arch) to '$directory'"
+  local version_meta
+  version_meta="$(get_version_meta "$version")"
+
+  local version_tag
+  version_tag="$(jq -r '.tag_name' <<< "$version_meta")"
+  
+  local filename
+  filename="$(
+    jq -r <<< "$version_meta" \
+      --arg platform "$platform" \
+      --arg arch "$arch" '
+        [ .assets[] 
+          | select(
+              .name | startswith("clark-browser-\($platform)-\($arch)")
+            )
+        ] 
+          | first 
+          | .name'
+  )"
+
+  if [[ "$filename" == "null" ]]; then
+    log "Error: version '$version' exists, but doesn't contain artifacts for '$arch-$platform'"
+    log "Available artifacts:"
+    jq -r <<< "$version_meta" '
+      .assets[] | "- \(.name)"
+    '
+    die 3
+  fi
+
+  local final_directory="$directory/clark"
+
+  local download_url
+  download_url="https://github.com/${CLARK_REPO}/releases/download/${version_tag}/${filename}"
+
+  local ext="${filename#*.}"
+  local -a extract_cmd
+  if [[ "$ext" == "zip" ]]
+    then extract_cmd=(unzip -q -o -d "$final_directory")
+  elif [[ "$ext" == "tar.gz" ]]
+    then extract_cmd=(tar -x -C "$final_directory" -f)
+  else
+    die 4 "Error: unsupported extension '$ext' for artifact '$filename'"
+  fi
+
+  require_command "${extract_cmd[0]}"
+
+  local output_file="$directory/$filename"
+  #rm -f "$directory/$filename"
+  log "Downloading '$download_url' to '$output_file'"
+  local curl_exit=0
+  curl -Lq --progress-bar "$download_url" -o "$output_file" || curl_exit=$?
+  if [[ "$curl_exit" != 0 ]]; then
+    die 5 "Error: curl exited with code $curl_exit"
+  else
+    log "Successfuly downloaded '$filename'"
+  fi
+
+  if [[ "$no_extract" == "no" ]];
+  then
+    log "Extracting '$filename' to '$final_directory'"
+    mkdir "$final_directory"
+    local extract_exit="0"
+    "${extract_cmd[@]}" "$directory/$filename" || extract_exit="$?"
+
+    if [[ "$extract_exit" != 0 ]]; then
+      if [[ "$ext" == "zip" && $SYSTEM_PLATFORM != "windows" && $extract_exit == "1" ]]; then
+        : # windows slashes on mac/linux throws an error that can be ignored
+      else
+        die 5 "Error: ${extract_cmd[0]} exited with code $extract_exit"
+      fi
+    fi
+    log "Successfuly extracted archive to '$final_directory'"
+  fi
+
+  local exe_path=""
+  case "$platform" in
+    darwin)
+      exe_path="clark/Chromium.app/Contents/MacOS/Chromium"
+      ;;
+    windows)
+      exe_path="clark/chrome.exe"
+      ;;
+    linux)
+      exe_path="clark/chrome"
+  esac
+
+  echo "$exe_path" > "$directory/clark-exe-path"
+
+  if [[ "$keep_archive" == "no" ]];
+  then
+    rm "$output_file"
+  fi
+}
+
+entrypoint() {
+  # print usage when no arguments are provided
+  if [[ $# -eq 0 ]]; then 
+    print_help
+    die 2
+  fi
+
+  local command="$1"
+  local name="$SCRIPT_NAME $command"
+  shift # remove command from stack
+
+  die_opt() { 
+    log "$name: $*"
+    echo
+    help
+    exit 2
+  }
+  arg_value() {
+    local opt="${1%%=*}"
+    local val="${1#*=}"
+    if [[ "$opt" == "$1" ]]
+    then # --arg value
+      _result="$2"
+      _consumed=2
+    else # --arg=value
+      _result="$val"
+      _consumed=1
+    fi
+  }
+
+  case "$command" in
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+
+    versions)
+      while [[ $# -gt 0 ]]; do
+        case $1 in
+          --help)
+            print_help
+            exit 0
+            ;;
+          *)
+            die_opt "unrecognized option: '$1'"
+            ;;
+        esac
+      done
+      cmd_versions
+      ;;
+
+    download)
+      local version=latest
+      local overwrite=no
+      local directory
+      local platform="$SYSTEM_PLATFORM"
+      local arch="$SYSTEM_ARCH"
+      local keep_archive="no"
+      local no_extract="no"
+      local -a positional
+
+      while [[ $# -gt 0 ]]; do
+        case $1 in
+          --help)
+            print_help
+            exit 0
+            ;;
+          -v*|--version*)
+            arg_value "$@"
+            version="$_result"
+            shift "$_consumed"
+            ;;
+          -p*|--platform*)
+            arg_value "$@"
+            platform="$_result"
+            shift "$_consumed"
+            ;;
+          -a*|--arch*)
+            arg_value "$@"
+            arch="$_result"
+            shift "$_consumed"
+            ;;
+          --overwrite)
+            overwrite="yes"
+            shift
+            ;;
+          -k|--keep-archive)
+            keep_archive="yes"
+            shift
+            ;;
+          --no-extract)
+            no_extract="yes"
+            shift
+            ;;
+          -*)
+            die_opt "unrecognized option: '$1'"
+            ;;
+          *)
+            positional+=("$1")
+            shift
+            ;;
+        esac
+      done
+      if (( ${#positional[@]} == 0 )); then
+        die_opt "positional argument required: DIRECTORY"
+      elif (( ${#positional[@]} > 1 )); then
+        die_opt "too many positional arguments"
+      fi
+      directory="${positional[0]}"
+
+      cmd_download "$version" "$platform" "$arch" "$overwrite" "$directory" "$keep_archive" "$no_extract"
+      ;;
+
+    *)
+      die_help "$SCRIPT_NAME: unrecognized command: $command"
+      ;;
+  esac 
+}
+
+main "$@"
